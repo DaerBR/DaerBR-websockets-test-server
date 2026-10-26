@@ -1,0 +1,20 @@
+{
+	"name": "websockets-server",
+	"private": true,
+	"version": "0.0.1",
+	"type": "module",
+	"scripts": {
+		"echo": "tsx watch src/echo.ts",
+		"typecheck": "tsc --noEmit",
+		"broadcast": "tsx watch src/broadcast.ts"
+	},
+	"dependencies": {
+		"ws": "^8.22.0"
+	},
+	"devDependencies": {
+		"@types/node": "^26.6.5",
+		"@types/ws": "^8.18.2",
+		"tsx": "^4.23.15",
+		"typescript": "^7.0.2"
+	}
+}
