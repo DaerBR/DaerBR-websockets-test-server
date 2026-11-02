@@ -3,13 +3,23 @@ import { WebSocket } from 'ws';
 // Stage 5d test helper: a client that never answers the server's ping frames,
 // which is what a sleeping laptop or a lost phone looks like to the server.
 // Run `pnpm dead-client` next to `pnpm server` and watch the server terminate it.
-const URL = 'ws://localhost:8081';
+// Since Stage 6 it has to look like our app: log in for a session cookie (6c), and send the app's Origin (6e).
+const URL = 'ws://localhost:8081/ws';
+const ORIGIN = 'http://localhost:5173';
 
 const startedAt = Date.now();
 const elapsed = () => `${((Date.now() - startedAt) / 1000).toFixed(1)}s`;
 
+const loginResponse = await fetch('http://localhost:8081/api/login', {
+	body: JSON.stringify({ name: 'dead-client', password: 'Password123!' }),
+	headers: { 'Content-Type': 'application/json' },
+	method: 'POST',
+});
+// "session=abc; Max-Age=...; HttpOnly" -> "session=abc"
+const cookie = loginResponse.headers.getSetCookie()[0]?.split(';')[0] ?? '';
+
 // autoPong: false turns off the automatic pong reply that every client normally sends.
-const socket = new WebSocket(URL, { autoPong: false });
+const socket = new WebSocket(URL, { autoPong: false, headers: { Cookie: cookie }, origin: ORIGIN });
 
 socket.on('open', () => {
 	console.log(`[${elapsed()}] connected to ${URL}, will never answer pings`);
