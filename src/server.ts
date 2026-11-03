@@ -1,6 +1,7 @@
 import express from 'express';
 import http from 'node:http';
 import { WebSocket, WebSocketServer } from 'ws';
+import { z } from 'zod';
 import { getUser, login, logout } from './auth/authController.js';
 import { getSessionById, readSessionId, sessionEvents } from './auth/sessions.js';
 
@@ -48,6 +49,13 @@ import { getSessionById, readSessionId, sessionEvents } from './auth/sessions.js
 //     A non-admin gets a system "Not allowed"; the socket stays open.
 // 6h: eager revocation. When a session ends (logout), sessions.ts emits 'ended' and we close that session's sockets
 //     with 4401 right away, instead of waiting for their next message (6g's check stays as the safety net).
+//
+// Stage 7 (lessons/stage-7-redux.md in the client repo):
+// 7e: client ids for optimistic updates. A chat message can come as a JSON frame with the client's own id:
+//       {"type":"chat","clientId":"V1StGXR8_Z5jdHi6B-myT","text":"hi"}
+//     The id is echoed in the broadcast chat frame (and kept in history, so a resume replay carries it too).
+//     If that message is rate-limited or too long, the sender gets {"type":"rejected","clientId":"...","reason":"..."}
+//     instead of a system line. Plain-text frames (commands, protocol strings, old clients) work as before.
 const PORT = 8081;
 const HEARTBEAT_INTERVAL_MS = 10000;
 const BURST_SIZE = 5;
@@ -74,9 +82,19 @@ const POLICY_VIOLATION_CLOSE_CODE = 1008;
 // App close code, mirrors HTTP 403: we know who you are, and you're out.
 const FORBIDDEN_CLOSE_CODE = 4403;
 const KICK_PREFIX = '/kick ';
+const MAX_CLIENT_ID_LENGTH = 64;
 
-type ChatEvent = { author: string; id: number; text: string; type: 'chat' };
+// 7e: the only JSON frame a client sends. Anything else (including invalid JSON) is treated as plain text.
+const chatFrameSchema = z.object({
+	clientId: z.string().min(1).max(MAX_CLIENT_ID_LENGTH),
+	text: z.string(),
+	type: z.literal('chat'),
+});
+
+// `clientId`: only on messages that came as a JSON chat frame (7e). Opaque to the server: stored and echoed, never read.
+type ChatEvent = { author: string; clientId?: string; id: number; text: string; type: 'chat' };
 type SystemEvent = { text: string; type: 'system' };
+type RejectedEvent = { clientId: string; reason: string; type: 'rejected' };
 type ClientState = {
 	connectedAt: number;
 	frozen: boolean;
@@ -115,10 +133,31 @@ const sendSystem = (socket: WebSocket, client: ClientState, text: string) => {
 	socket.send(client.wantsJson ? JSON.stringify(event) : text);
 };
 
+// 7e: "your message <clientId> was not accepted". Only JSON clients send client ids, so it's always JSON.
+const sendRejected = (socket: WebSocket, clientId: string, reason: string) => {
+	const event: RejectedEvent = { clientId, reason, type: 'rejected' };
+	socket.send(JSON.stringify(event));
+};
+
+// A JSON chat frame, or null for everything else (commands, protocol strings, plain-text chat).
+const parseChatFrame = (text: string) => {
+	if (!text.startsWith('{')) {
+		return null;
+	}
+
+	try {
+		const result = chatFrameSchema.safeParse(JSON.parse(text));
+
+		return result.success ? result.data : null;
+	} catch {
+		return null;
+	}
+};
+
 // "Send to everyone" is just a loop. Includes the sender: the server decides the order everyone sees.
 // The author comes from the sender's session (stored at connection time), never from the message itself.
-const broadcast = (sender: ClientState, text: string) => {
-	const event: ChatEvent = { author: sender.name, id: nextId++, text, type: 'chat' };
+const broadcast = (sender: ClientState, text: string, clientId?: string) => {
+	const event: ChatEvent = { author: sender.name, id: nextId++, text, type: 'chat', ...(clientId && { clientId }) };
 	history.push(event);
 
 	if (history.length > HISTORY_SIZE) {
@@ -135,6 +174,30 @@ const broadcast = (sender: ClientState, text: string) => {
 	}
 
 	console.log(`  -> #${event.id} broadcast to ${reached} client(s)`);
+};
+
+// App validation: the transport limit let it through, but is it a valid chat message?
+// With a client id (7e), a rejection names the message; without one, it's a system line as before.
+const acceptChat = (socket: WebSocket, client: ClientState, text: string, clientId?: string) => {
+	const chatText = text.trim();
+
+	if (chatText === '') {
+		return;
+	}
+
+	if (chatText.length > MAX_TEXT_LENGTH) {
+		const reason = `Message too long (max ${MAX_TEXT_LENGTH} characters)`;
+
+		if (clientId) {
+			sendRejected(socket, clientId, reason);
+		} else {
+			sendSystem(socket, client, reason);
+		}
+
+		return;
+	}
+
+	broadcast(client, chatText, clientId);
 };
 
 const resume = (socket: WebSocket, client: ClientState, lastIdText: string) => {
@@ -354,6 +417,9 @@ wss.on('connection', (socket, request) => {
 			return;
 		}
 
+		// 7e: null unless this is a JSON chat frame with a client id.
+		const chatFrame = parseChatFrame(text);
+
 		// Everything below costs a token. The heartbeat above never does: limiting it would look like a dead connection.
 		if (!takeToken(client)) {
 			client.rateLimitStrikes += 1;
@@ -366,7 +432,12 @@ wss.on('connection', (socket, request) => {
 			}
 
 			console.log(`[#${client.id}] rate limit: rejected "${text.slice(0, 40)}" (strike ${client.rateLimitStrikes})`);
-			sendSystem(socket, client, 'Slow down: too many messages');
+
+			if (chatFrame) {
+				sendRejected(socket, chatFrame.clientId, 'Slow down: too many messages');
+			} else {
+				sendSystem(socket, client, 'Slow down: too many messages');
+			}
 
 			return;
 		}
@@ -379,6 +450,14 @@ wss.on('connection', (socket, request) => {
 		if (!session) {
 			console.log(`[#${client.id}] session ended: closing with 4401`);
 			socket.close(UNAUTHORIZED_CLOSE_CODE, 'session ended');
+
+			return;
+		}
+
+		// 7e: a JSON chat frame is always a chat message, never a command or a protocol string.
+		if (chatFrame) {
+			console.log(`[#${client.id}] chat ${chatFrame.clientId}: ${chatFrame.text}`);
+			acceptChat(socket, client, chatFrame.text, chatFrame.clientId);
 
 			return;
 		}
@@ -444,20 +523,8 @@ wss.on('connection', (socket, request) => {
 			return;
 		}
 
-		// App validation: the transport limit let it through, but is it a valid chat message?
-		const chatText = text.trim();
-
-		if (chatText === '') {
-			return;
-		}
-
-		if (chatText.length > MAX_TEXT_LENGTH) {
-			sendSystem(socket, client, `Message too long (max ${MAX_TEXT_LENGTH} characters)`);
-
-			return;
-		}
-
-		broadcast(client, chatText);
+		// Plain-text chat (pre-7e clients).
+		acceptChat(socket, client, text);
 	});
 
 	socket.on('close', (code, reason) => {
